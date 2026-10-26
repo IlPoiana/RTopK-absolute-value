@@ -6,6 +6,27 @@
 #include <algorithm>
 #include <iomanip>
 #include "rtopk_kernel.cuh"
+#if defined(DTYPE_FP16)
+#include <cuda_fp16.h>
+typedef __half data_t;
+__global__ void convert_kernel(const float *in, __half *out, int n){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n){
+        out[i] = __float2half(in[i]);
+    }
+}
+#elif defined(DTYPE_BF16)
+#include <cuda_bf16.h>
+typedef __nv_bfloat16 data_t;
+__global__ void convert_kernel(const float *in, __nv_bfloat16 *out, int n){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n){
+        out[i] = __float2bfloat16(in[i]);
+    }
+}
+#else
+typedef float data_t;
+#endif
 
 #define timestamp(__var__) auto __var__ = std::chrono::system_clock::now();
 inline double getDuration(std::chrono::time_point<std::chrono::system_clock> a,
@@ -34,20 +55,29 @@ int main() {
 
     cout << "max N = " << max_N << ", preparing data..." << endl;
 
-    float *value;
+    data_t *value;
     int *index;
 
-    cudaMallocManaged(&value, max_N * max_dim_k * sizeof(float));
+    cudaMallocManaged(&value, max_N * max_dim_k * sizeof(data_t));
     cudaMallocManaged(&index, max_N * max_dim_k * sizeof(int));
 
     curandGenerator_t gen;
-    float *devData;
-    cudaMalloc((void **)&devData, max_N * max_dim_origin * sizeof(float));
+    data_t *devData;
+    cudaMalloc((void **)&devData, max_N * max_dim_origin * sizeof(data_t));
 
 
     curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
     curandSetPseudoRandomGeneratorSeed(gen, 1234ULL);
+#if defined(DTYPE_FP16) || defined(DTYPE_BF16)
+    float *genData;
+    cudaMalloc((void **)&genData, max_N * max_dim_origin * sizeof(float));
+    curandGenerateUniform(gen, genData, max_N * max_dim_origin);
+    convert_kernel<<<(max_N * max_dim_origin + 255) / 256, 256>>>(genData, devData, max_N * max_dim_origin);
+    cudaDeviceSynchronize(); // Am I a joke to you? 
+    cudaFree(genData);
+#else
     curandGenerateUniform(gen, devData, max_N * max_dim_origin);
+#endif
     
     cout << "data ready, testing..." << endl;
 
@@ -75,7 +105,7 @@ int main() {
                         else{
                             w = 1;
                         }
-                        int shared_size = w * dim_origin * sizeof(float);
+                        int shared_size = w * dim_origin * sizeof(data_t);
                         int times = 4;
                         // warmup
                         for (int i = 0; i < times; i++) {

@@ -23,6 +23,33 @@ cmake ..
 make
 ```
 
+### Choose the data type
+The kernels are compiled for one data type per build, selected with the `DTYPE` option when running CMake:
+
+| `DTYPE` | Element type | Macro defined |
+|---------|--------------|---------------|
+| `fp32` (default) | `float` | none |
+| `fp16` | `__half` | `DTYPE_FP16` |
+| `bf16` | `__nv_bfloat16` | `DTYPE_BF16` |
+
+Example, building the bf16 version:
+```sh
+mkdir build
+cd build
+cmake -DDTYPE=bf16 ..
+make
+```
+
+To build only one executable, name its target, e.g. `make rtopk`.
+
+The value is cached in the build directory: a later `cmake ..` keeps the last `DTYPE`. To go back to fp32, run `cmake -DDTYPE=fp32 ..`. To keep several data types side by side, use one build directory each:
+```sh
+mkdir build_fp16
+cd build_fp16
+cmake -DDTYPE=fp16 ..
+make
+```
+
 ## Run the test
 ```sh
 ./rtopk

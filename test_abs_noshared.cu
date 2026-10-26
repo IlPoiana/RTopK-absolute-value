@@ -6,6 +6,45 @@
 #include <algorithm>
 #include <iomanip>
 #include "rtopk_kernel.cuh"
+#if defined(DTYPE_FP16)
+#include <cuda_fp16.h>
+typedef __half data_t;
+__global__ void convert_kernel(const float *in, __half *out, int n){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n){
+        out[i] = __float2half(in[i]);
+    }
+}
+__global__ void abs_kernel(const __half *in, __half *out, int n){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n){
+        out[i] = __habs(in[i]);
+    }
+}
+#elif defined(DTYPE_BF16)
+#include <cuda_bf16.h>
+typedef __nv_bfloat16 data_t;
+__global__ void convert_kernel(const float *in, __nv_bfloat16 *out, int n){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n){
+        out[i] = __float2bfloat16(in[i]);
+    }
+}
+__global__ void abs_kernel(const __nv_bfloat16 *in, __nv_bfloat16 *out, int n){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n){
+        out[i] = __habs(in[i]);
+    }
+}
+#else
+typedef float data_t;
+__global__ void abs_kernel(const float *in, float *out, int n){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n){
+        out[i] = fabsf(in[i]);
+    }
+}
+#endif
 
 #define timestamp(__var__) auto __var__ = std::chrono::system_clock::now();
 inline double getDuration(std::chrono::time_point<std::chrono::system_clock> a,
@@ -15,13 +54,6 @@ inline double getDuration(std::chrono::time_point<std::chrono::system_clock> a,
 }
 
 using namespace std;
-
-__global__ void abs_kernel(const float *in, float *out, int n){
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if(i < n){
-        out[i] = fabsf(in[i]);
-    }
-}
 
 inline int warps_per_block(int dim_origin){
     if (dim_origin <= 1024){
@@ -36,8 +68,8 @@ inline int warps_per_block(int dim_origin){
     return 1;
 }
 
-void launch_rtopk(int w, float *data, float *value, int *index, int N, int dim_origin, int dim_k, int max_iter, float precision){
-    int shared_size = w * dim_origin * sizeof(float);
+void launch_rtopk(int w, data_t *data, data_t *value, int *index, int N, int dim_origin, int dim_k, int max_iter, float precision){
+    int shared_size = w * dim_origin * sizeof(data_t);
     if(w == 8){
         rtopk_kernel<8><<<N / w, w * 32, shared_size>>>(data, value, index, N, dim_origin, dim_k, max_iter, precision);
     }
@@ -52,8 +84,8 @@ void launch_rtopk(int w, float *data, float *value, int *index, int N, int dim_o
     }
 }
 
-void launch_rtopk_abs_noshared(int w, float *data, float *value, int *index, int N, int dim_origin, int dim_k, int max_iter, float precision){
-    int shared_size = w * dim_origin * sizeof(float);
+void launch_rtopk_abs_noshared(int w, data_t *data, data_t *value, int *index, int N, int dim_origin, int dim_k, int max_iter, float precision){
+    int shared_size = w * dim_origin * sizeof(data_t);
     if(w == 8){
         rtopk_abs_noshared_kernel<8><<<N / w, w * 32, shared_size>>>(data, value, index, N, dim_origin, dim_k, max_iter, precision);
     }
@@ -86,20 +118,29 @@ int main() {
 
     cout << "max N = " << max_N << ", preparing data..." << endl;
 
-    float *value;
+    data_t *value;
     int *index;
 
-    cudaMallocManaged(&value, max_N * max_dim_k * sizeof(float));
+    cudaMallocManaged(&value, max_N * max_dim_k * sizeof(data_t));
     cudaMallocManaged(&index, max_N * max_dim_k * sizeof(int));
 
     curandGenerator_t gen;
-    float *devData;
-    cudaMalloc((void **)&devData, max_N * max_dim_origin * sizeof(float));
+    data_t *devData;
+    cudaMalloc((void **)&devData, max_N * max_dim_origin * sizeof(data_t));
 
 
     curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
     curandSetPseudoRandomGeneratorSeed(gen, 1234ULL);
+#if defined(DTYPE_FP16) || defined(DTYPE_BF16)
+    float *genData;
+    cudaMalloc((void **)&genData, max_N * max_dim_origin * sizeof(float));
+    curandGenerateUniform(gen, genData, max_N * max_dim_origin);
+    convert_kernel<<<(max_N * max_dim_origin + 255) / 256, 256>>>(genData, devData, max_N * max_dim_origin);
+    cudaDeviceSynchronize();
+    cudaFree(genData);
+#else
     curandGenerateUniform(gen, devData, max_N * max_dim_origin);
+#endif
     
     cout << "data ready, testing..." << endl;
 
@@ -127,7 +168,7 @@ int main() {
                         else{
                             w = 1;
                         }
-                        int shared_size = w * dim_origin * sizeof(float);
+                        int shared_size = w * dim_origin * sizeof(data_t);
                         int times = 4;
                         // warmup
                         for (int i = 0; i < times; i++) {
@@ -184,16 +225,25 @@ int main() {
     int check_dim_origin_list[] = {512, 1024, 2048, 4096, 8192};
 
     int total_elems = max_N * max_dim_origin;
-    float *absData;
-    cudaMalloc((void **)&absData, total_elems * sizeof(float));
+    data_t *absData;
+    cudaMalloc((void **)&absData, total_elems * sizeof(data_t));
 
     // overwrite the benchmark data (uniform, all positive) with values of both signs
+#if defined(DTYPE_FP16) || defined(DTYPE_BF16)
+    cudaMalloc((void **)&genData, total_elems * sizeof(float));
+    curandGenerateNormal(gen, genData, total_elems, 0.0f, 1.0f);
+    convert_kernel<<<(total_elems + 255) / 256, 256>>>(genData, devData, total_elems);
+    cudaDeviceSynchronize();
+    cudaFree(genData);
+#else
     curandGenerateNormal(gen, devData, total_elems, 0.0f, 1.0f);
+#endif
+    // |x| is taken from the already converted data, so both kernels see exactly the same magnitudes
     abs_kernel<<<(total_elems + 255) / 256, 256>>>(devData, absData, total_elems);
 
-    float *value_ref;
+    data_t *value_ref;
     int *index_ref;
-    cudaMallocManaged(&value_ref, max_N * max_dim_k * sizeof(float));
+    cudaMallocManaged(&value_ref, max_N * max_dim_k * sizeof(data_t));
     cudaMallocManaged(&index_ref, max_N * max_dim_k * sizeof(int));
 
     int checked_configs = 0, failed_configs = 0;
@@ -225,8 +275,9 @@ int main() {
                             if(index[i] != index_ref[i] || index[i] < 0 || index[i] >= dim_origin){
                                 index_mismatch++;
                             }
-                            // abs kernel returns the signed value, rtopk on |x| returns its magnitude
-                            else if(fabsf(value[i]) != value_ref[i]){
+                            // abs kernel returns the signed value, rtopk on |x| returns its magnitude.
+                            // Compared in float: converting fp16/bf16 to float is exact.
+                            else if(fabsf((float)value[i]) != (float)value_ref[i]){
                                 value_mismatch++;
                             }
                             else{
@@ -246,8 +297,8 @@ int main() {
                             << (ok ? "  OK" : "  FAIL") << endl;
                         if(first_bad >= 0){
                             cout<< "    first mismatch at row " << first_bad / dim_k << ", slot " << first_bad % dim_k
-                                << ": rtopk(|x|) index = " << index_ref[first_bad] << ", value = " << value_ref[first_bad]
-                                << " | rtopk_abs(x) index = " << index[first_bad] << ", value = " << value[first_bad] << endl;
+                                << ": rtopk(|x|) index = " << index_ref[first_bad] << ", value = " << (float)value_ref[first_bad]
+                                << " | rtopk_abs(x) index = " << index[first_bad] << ", value = " << (float)value[first_bad] << endl;
                         }
                     }
                 }
