@@ -16,6 +16,58 @@ inline double getDuration(std::chrono::time_point<std::chrono::system_clock> a,
 
 using namespace std;
 
+__global__ void abs_kernel(const float *in, float *out, int n){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n){
+        out[i] = fabsf(in[i]);
+    }
+}
+
+inline int warps_per_block(int dim_origin){
+    if (dim_origin <= 1024){
+        return 8;
+    }
+    else if(dim_origin <= 2048){
+        return 4;
+    }
+    else if(dim_origin <= 4096){
+        return 2;
+    }
+    return 1;
+}
+
+void launch_rtopk(int w, float *data, float *value, int *index, int N, int dim_origin, int dim_k, int max_iter, float precision){
+    int shared_size = w * dim_origin * sizeof(float);
+    if(w == 8){
+        rtopk_kernel<8><<<N / w, w * 32, shared_size>>>(data, value, index, N, dim_origin, dim_k, max_iter, precision);
+    }
+    else if(w == 4){
+        rtopk_kernel<4><<<N / w, w * 32, shared_size>>>(data, value, index, N, dim_origin, dim_k, max_iter, precision);
+    }
+    else if(w == 2){
+        rtopk_kernel<2><<<N / w, w * 32, shared_size>>>(data, value, index, N, dim_origin, dim_k, max_iter, precision);
+    }
+    else{
+        rtopk_kernel<1><<<N / w, w * 32, shared_size>>>(data, value, index, N, dim_origin, dim_k, max_iter, precision);
+    }
+}
+
+void launch_rtopk_abs_noshared(int w, float *data, float *value, int *index, int N, int dim_origin, int dim_k, int max_iter, float precision){
+    int shared_size = w * dim_origin * sizeof(float);
+    if(w == 8){
+        rtopk_abs_noshared_kernel<8><<<N / w, w * 32, shared_size>>>(data, value, index, N, dim_origin, dim_k, max_iter, precision);
+    }
+    else if(w == 4){
+        rtopk_abs_noshared_kernel<4><<<N / w, w * 32, shared_size>>>(data, value, index, N, dim_origin, dim_k, max_iter, precision);
+    }
+    else if(w == 2){
+        rtopk_abs_noshared_kernel<2><<<N / w, w * 32, shared_size>>>(data, value, index, N, dim_origin, dim_k, max_iter, precision);
+    }
+    else{
+        rtopk_abs_noshared_kernel<1><<<N / w, w * 32, shared_size>>>(data, value, index, N, dim_origin, dim_k, max_iter, precision);
+    }
+}
+
 int main() {
     // int N_list[] = {16384, 65536, 262144, 1048576};
     int N_list[] = {65536};
@@ -123,6 +175,92 @@ int main() {
     }
 
     fout.close();
+
+    // Numerical check: rtopk on a precomputed |x| array vs rtopk_abs_noshared on the signed x.
+    // Both kernels do the same comparisons on |x|, so the selected indexes must match exactly.
+    cout << "numerical check, preparing signed data..." << endl;
+
+    // one dim_origin per warps-per-block branch (8, 8, 4, 2, 1)
+    int check_dim_origin_list[] = {512, 1024, 2048, 4096, 8192};
+
+    int total_elems = max_N * max_dim_origin;
+    float *absData;
+    cudaMalloc((void **)&absData, total_elems * sizeof(float));
+
+    // overwrite the benchmark data (uniform, all positive) with values of both signs
+    curandGenerateNormal(gen, devData, total_elems, 0.0f, 1.0f);
+    abs_kernel<<<(total_elems + 255) / 256, 256>>>(devData, absData, total_elems);
+
+    float *value_ref;
+    int *index_ref;
+    cudaMallocManaged(&value_ref, max_N * max_dim_k * sizeof(float));
+    cudaMallocManaged(&index_ref, max_N * max_dim_k * sizeof(int));
+
+    int checked_configs = 0, failed_configs = 0;
+
+    for (int N : N_list){
+        for (int dim_origin : check_dim_origin_list){
+            for (int dim_k : dim_k_list){
+                if(dim_k >= dim_origin){
+                    continue;
+                }
+                for (float precision : precision_list){
+                    for (int max_iter : max_iter_list){
+                        int w = warps_per_block(dim_origin);
+
+                        // -1 marks slots a kernel never wrote, so they can't match by accident
+                        cudaMemset(index_ref, 0xFF, N * dim_k * sizeof(int));
+                        cudaMemset(index, 0xFF, N * dim_k * sizeof(int));
+
+                        launch_rtopk(w, absData, value_ref, index_ref, N, dim_origin, dim_k, max_iter, precision);
+                        launch_rtopk_abs_noshared(w, devData, value, index, N, dim_origin, dim_k, max_iter, precision);
+                        cudaDeviceSynchronize();
+                        cudaError_t err = cudaGetLastError();
+                        if(err != cudaSuccess){
+                            cout << "CUDA error: " << cudaGetErrorString(err) << endl;
+                        }
+
+                        int index_mismatch = 0, value_mismatch = 0, first_bad = -1;
+                        for (int i = 0; i < N * dim_k; i++){
+                            if(index[i] != index_ref[i] || index[i] < 0 || index[i] >= dim_origin){
+                                index_mismatch++;
+                            }
+                            // abs kernel returns the signed value, rtopk on |x| returns its magnitude
+                            else if(fabsf(value[i]) != value_ref[i]){
+                                value_mismatch++;
+                            }
+                            else{
+                                continue;
+                            }
+                            if(first_bad < 0){
+                                first_bad = i;
+                            }
+                        }
+
+                        bool ok = err == cudaSuccess && index_mismatch == 0 && value_mismatch == 0;
+                        checked_configs++;
+                        failed_configs += !ok;
+
+                        cout<< "N = " << N << ", dim_origin = " << dim_origin << ", dim_k = " << dim_k << ", max_iter = " << max_iter
+                            << ", index mismatches = " << index_mismatch << ", value mismatches = " << value_mismatch
+                            << (ok ? "  OK" : "  FAIL") << endl;
+                        if(first_bad >= 0){
+                            cout<< "    first mismatch at row " << first_bad / dim_k << ", slot " << first_bad % dim_k
+                                << ": rtopk(|x|) index = " << index_ref[first_bad] << ", value = " << value_ref[first_bad]
+                                << " | rtopk_abs(x) index = " << index[first_bad] << ", value = " << value[first_bad] << endl;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    cout << "numerical check: " << checked_configs - failed_configs << " / " << checked_configs << " configs passed"
+         << (failed_configs == 0 ? " (PASS)" : " (FAIL)") << endl;
+
+    cudaFree(absData);
+    cudaFree(value_ref);
+    cudaFree(index_ref);
 
     // Free unified memory
     cudaFree(value);
