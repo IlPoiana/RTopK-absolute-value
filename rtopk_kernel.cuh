@@ -15,6 +15,10 @@ __global__ void rtopk_kernel(half *data, half *value, int *index, int N, int dim
 template <int WARPS_PER_BLOCK>
 __global__ void rtopk_abs_noshared_kernel(half *data, half *value, int *index, int N, int dim_origin, int k, int max_iter, half precision);
 
+template <int WARPS_PER_BLOCK>
+__global__ void rtopk_abs_index_kernel(half *data, half *value, int *index, int N, int dim_origin, int k, int max_iter, half precision);
+
+
 #elif defined(DTYPE_BF16)
 #include <cuda_bf16.h>
 template <int WARPS_PER_BLOCK>
