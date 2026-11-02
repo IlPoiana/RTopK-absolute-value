@@ -18,6 +18,10 @@ __global__ void rtopk_abs_noshared_kernel(half *data, half *value, int *index, i
 template <int WARPS_PER_BLOCK>
 __global__ void rtopk_abs_index_kernel(half *data, half *value, int *index, int N, int dim_origin, int k, int max_iter, half precision);
 
+// Overload: rows are the BSHD rows of [B, seq_len, heads, dim_origin], index = (b * heads + h) * dim_origin + f
+template <int WARPS_PER_BLOCK>
+__global__ void rtopk_abs_index_kernel(half *data, half *value, int *index, int N, int dim_origin, int k, int max_iter, half precision, int heads, int seq_len);
+
 
 #elif defined(DTYPE_BF16)
 #include <cuda_bf16.h>
@@ -36,6 +40,10 @@ __global__ void rtopk_abs_noshared_kernel(float *data, float *value, int *index,
 
 template <int WARPS_PER_BLOCK>
 __global__ void rtopk_abs_index_kernel(float *data, float *value, int *index, int N, int dim_origin, int k, int max_iter, float precision);
+
+// Overload: rows are the BSHD rows of [B, seq_len, heads, dim_origin], index = (b * heads + h) * dim_origin + f
+template <int WARPS_PER_BLOCK>
+__global__ void rtopk_abs_index_kernel(float *data, float *value, int *index, int N, int dim_origin, int k, int max_iter, float precision, int heads, int seq_len);
 
 #endif
 
