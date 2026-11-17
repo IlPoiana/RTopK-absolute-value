@@ -415,6 +415,143 @@ __global__ void rtopk_abs_index_kernel(half *data, half *value, int *index, int 
 
 }
 
+// rtopk_abs_index_kernel with the k features of each row written in ascending feature order: same bisection, same
+// selected set and values. rtopk_abs_index_kernel writes A = {|x| >= thres} in feature order and, when A has fewer
+// than k elements (bisection stopped on `close` or by EARLY_STOP), appends the first elements of
+// B = {min_data <= |x| < thres}: that row is A then B, not sorted. Here a single pass in feature order takes the first
+// min(|A|, k) elements of A and the first k - min(|A|, k) of B (the set of the two passes) and writes each one at the
+// number of elements taken before it.
+template <int WARPS_PER_BLOCK>
+__global__ void rtopk_abs_index_sorted_kernel(half *data, half *value, int *index, int N, int dim_origin, int k, int max_iter, half precision)
+{
+    extern __shared__ half cache[];
+    const int wid = threadIdx.x / 32;
+    const int laneid = threadIdx.x % 32;
+
+    if (blockIdx.x * WARPS_PER_BLOCK + wid >= N){
+        return;
+    }
+
+    const int dim_len = (dim_origin + 31) / 32;
+
+    for(int ext = 0; ext < dim_len; ext++){
+        cache[wid * dim_origin + laneid + ext * 32] = data[blockIdx.x * WARPS_PER_BLOCK * dim_origin + wid * dim_origin + laneid + ext * 32];
+    }
+
+    __syncwarp();
+
+    half max_data = -CUDART_MAX_NORMAL_FP16, min_data = CUDART_MAX_NORMAL_FP16;
+
+    for(int j = 0; j < dim_len; j++){
+        if(__habs(cache[wid * dim_origin + laneid + j * 32]) > max_data){
+            max_data = __habs(cache[wid * dim_origin + laneid + j * 32]);
+        }
+        if(__habs(cache[wid * dim_origin + laneid + j * 32]) < min_data){
+            min_data = __habs(cache[wid * dim_origin + laneid + j * 32]);
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 32 / 2; offset > 0; offset /= 2) {
+        max_data = __hmax(max_data, __shfl_down_sync(0xFFFFFFFF, max_data, offset));
+        min_data = __hmin(min_data, __shfl_down_sync(0xFFFFFFFF, min_data, offset));
+    }
+
+    max_data = __shfl_sync(0xFFFFFFFF, max_data, 0);
+    min_data = __shfl_sync(0xFFFFFFFF, min_data, 0);
+
+    half mid_data = __float2half(__half2float(max_data) + __half2float(min_data) / 2);//Kept in float to avoid overflow
+
+    int count;
+
+    bool close = false;
+
+    for(int i = 0; ; i++){
+        count = 0;
+        for(int j = 0; j < dim_len; j++){
+            count += __habs(cache[wid * dim_origin + laneid + j * 32]) >= mid_data;
+        }
+
+        count += __shfl_down_sync(0xffffffff, count, 16);
+        count += __shfl_down_sync(0xffffffff, count, 8);
+        count += __shfl_down_sync(0xffffffff, count, 4);
+        count += __shfl_down_sync(0xffffffff, count, 2);
+        count += __shfl_down_sync(0xffffffff, count, 1);
+        count = __shfl_sync(0xffffffff, count, 0);
+
+#ifdef EARLY_STOP
+        if(i >= max_iter){
+            break;
+        }
+#endif
+
+        if(count < k){
+            max_data = mid_data;
+        }
+        else if(count > k){
+            min_data = mid_data;
+        }
+        else{
+            break;
+        }
+        half new_mid = __float2half((__half2float(max_data) + __half2float(min_data) )/ 2);;
+        if (new_mid == max_data || new_mid == min_data || max_data - min_data <= precision ){
+            close = true;
+            break;
+        }
+        else{
+            mid_data = new_mid;
+        }
+    }
+
+    half thres = close ? max_data : mid_data;
+
+    // |A|, then how many elements of A and of B the row takes
+    int count_a = 0;
+    for(int j = 0; j < dim_len; j++){
+        count_a += __habs(cache[wid * dim_origin + laneid + j * 32]) >= thres;
+    }
+    count_a += __shfl_down_sync(0xffffffff, count_a, 16);
+    count_a += __shfl_down_sync(0xffffffff, count_a, 8);
+    count_a += __shfl_down_sync(0xffffffff, count_a, 4);
+    count_a += __shfl_down_sync(0xffffffff, count_a, 2);
+    count_a += __shfl_down_sync(0xffffffff, count_a, 1);
+    count_a = __shfl_sync(0xffffffff, count_a, 0);
+    const int need_a = min(count_a, k);
+    const int need_b = k - need_a;
+
+    // single pass in feature order: rank of an element among the A (B) elements before it, from the ballots
+    const unsigned lanes_below = (1u << laneid) - 1u;
+    const int row_out = blockIdx.x * WARPS_PER_BLOCK * k + wid * k;
+    int taken_a = 0;
+    int taken_b = 0;
+    int total_cnt = 0;
+    for(int ext = 0; ext < dim_len; ext++){
+        if(total_cnt >= k){
+            return;
+        }
+        half val = cache[wid * dim_origin + laneid + ext * 32];
+        const half mag = __habs(val);
+        const bool in_a = mag >= thres;
+        const bool in_b = !in_a && mag >= min_data;
+        const unsigned mask_a = __ballot_sync(0xffffffff, in_a);
+        const unsigned mask_b = __ballot_sync(0xffffffff, in_b);
+        const bool choose = (in_a && taken_a + __popc(mask_a & lanes_below) < need_a) ||
+                            (in_b && taken_b + __popc(mask_b & lanes_below) < need_b);
+        const unsigned mask = __ballot_sync(0xffffffff, choose);
+
+        if(choose){
+            const int pos = total_cnt + __popc(mask & lanes_below);
+            value[row_out + pos] = val;
+            index[row_out + pos] = (laneid + ext * 32) % dim_origin;
+        }
+
+        taken_a += __popc(mask_a);
+        taken_b += __popc(mask_b);
+        total_cnt += __popc(mask);
+    }
+}
+
 // Overload of rtopk_abs_index_kernel with the column re-indexing of the FlashSFA preprocessing (same selection).
 // The N rows are the BSHD rows of a [B, seq_len, heads, dim_origin] tensor: row r = (b * seq_len + j) * heads + h.
 // The index of feature f is the column (b * heads + h) * dim_origin + f, so every (batch, head) pair owns its own
@@ -571,6 +708,11 @@ template __global__ void rtopk_abs_index_kernel<8>(half*, half*, int*, int, int,
 template __global__ void rtopk_abs_index_kernel<4>(half*, half*, int*, int, int, int, int, half);
 template __global__ void rtopk_abs_index_kernel<2>(half*, half*, int*, int, int, int, int, half);
 template __global__ void rtopk_abs_index_kernel<1>(half*, half*, int*, int, int, int, int, half);
+
+template __global__ void rtopk_abs_index_sorted_kernel<8>(half*, half*, int*, int, int, int, int, half);
+template __global__ void rtopk_abs_index_sorted_kernel<4>(half*, half*, int*, int, int, int, int, half);
+template __global__ void rtopk_abs_index_sorted_kernel<2>(half*, half*, int*, int, int, int, int, half);
+template __global__ void rtopk_abs_index_sorted_kernel<1>(half*, half*, int*, int, int, int, int, half);
 
 template __global__ void rtopk_abs_index_kernel<8>(half*, half*, int*, int, int, int, int, half, int, int);
 template __global__ void rtopk_abs_index_kernel<4>(half*, half*, int*, int, int, int, int, half, int, int);
